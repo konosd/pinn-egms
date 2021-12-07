@@ -47,7 +47,7 @@ class fk_system():
         
 
 
-    def read_simulation(self, filename):
+    def read_simulation(self, filename, collapse = True):
         self.params, self.D = fk.io.load_params(filename)
         for key in self.params:
             self.params[key] = torch.as_tensor(self.params[key])
@@ -57,10 +57,9 @@ class fk_system():
         X = np.linspace(0, 4, 128)
         Y = np.linspace(0, 4, 128)
         T = np.arange(self.min_t, self.max_t, self.t_step)
+        d = np.tile(self.D, [len(T), 1, 1])#.transpose(1,2,0).reshape(-1,1)
+        
         t, x, y = np.meshgrid(T, X, Y, indexing = 'ij')
-        x = x.reshape(-1,1)
-        t = t.reshape(-1,1)
-        y = y.reshape(-1,1)
 
         f = h5py.File(filename, 'r')
 
@@ -68,13 +67,19 @@ class fk_system():
         w = f['states'][self.min_t: self.max_t:self.t_step, 1]#.transpose((1,2,0))
         u = f['states'][self.min_t: self.max_t:self.t_step, 2]#.transpose((1,2,0))
         phi = f['states'][self.min_t: self.max_t:self.t_step, 4]#.transpose((1,2,0))
+
+        if collapse == False:
+            return np.concatenate((x[np.newaxis], y[np.newaxis], t[np.newaxis]), 0).transpose(1,0,2,3), np.stack((v,w,u,d,phi)).transpose(1,0,2,3)
         
+        x = x.reshape(-1,1)
+        t = t.reshape(-1,1)
+        y = y.reshape(-1,1)
 
         v = v.reshape(-1,1)
         u = u.reshape(-1,1)
         w = w.reshape(-1,1)
         phi = phi.reshape(-1,1)
-        d = np.tile(self.D, [len(T), 1, 1])#.transpose(1,2,0).reshape(-1,1)
+        
 #         d = self.D.reshape(-1,1)
 #         x_d, y_d = np.meshgrid(X, Y)
 #         x_d.reshape(-1,1)
@@ -799,6 +804,7 @@ class model_trainer_egm_homogeneous():
         return self.model_u, losses
 
 
+
 class model_trainer_phi_homogeneous():
     def __init__(self, model_u, train_data, test_data, batch_size, geomtime, bc, loss, system):
         self.model_u = model_u
@@ -1126,6 +1132,9 @@ class model_trainer_phi_homogeneous():
             increment.append(increment[-1]+1)
         return self.model_u, losses
     
+
+
+
 class model_trainer_egm_homogeneous_no_pinn():
     def __init__(self, model_u, train_data, test_data, batch_size, geomtime, bc, loss, system):
         self.model_u = model_u

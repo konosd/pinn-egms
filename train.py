@@ -1,4 +1,4 @@
-from egm_pinns import *
+from conv_egm_pinns import *
 import argparse
 import os
 import pickle

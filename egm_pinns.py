@@ -140,7 +140,7 @@ class fk_system():
 
         return [eq_a, eq_b, eq_c]
     
-    def  heterogeneous_pde_loss(self, x, u, d):
+    def  heterogeneous_pde_loss(self, x, u, d, x_d):
         """
         x = [x,y,t]
         y = [v, w, u, DD]
@@ -152,10 +152,12 @@ class fk_system():
 
 
         du = torch.autograd.grad(u, x, grad_outputs = torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        ddu = torch.autograd.grad(du, x, grad_outputs = torch.ones_like(du), retain_graph=True)[0]
+
         dw = torch.autograd.grad(w, x, grad_outputs = torch.ones_like(u), retain_graph=True, create_graph=True)[0]
         dv = torch.autograd.grad(v, x, grad_outputs = torch.ones_like(u), retain_graph=True, create_graph=True)[0]
         
-        dd = torch.autograd.grad(d, x[:,:2], grad_outputs = torch.ones_like(d), retain_graph = True, create_graph = True)[0]
+        dd = torch.autograd.grad(d, x_d, grad_outputs = torch.ones_like(d), retain_graph = True, create_graph = True)[0]
         dd_x, dd_y = dd[:,0], dd[:,1]
 
         du_t, du_x, du_y = du[:,2], du[:,0], du[:,1]
@@ -181,7 +183,7 @@ class fk_system():
 
         # d = torch.sigmoid(d)*0.0009 + 0.0001
 
-        ddu = torch.autograd.grad(du, x, grad_outputs = torch.ones_like(du), retain_graph=True)[0]
+        
 
         du_xx, du_yy = ddu[:,0], ddu[:,1] 
 
@@ -208,22 +210,6 @@ class fk_system():
         observe_init = observe_train[idx_init]
         return dde.PointSetBC(observe_init,v_init,component=0)
     
-    def modify_heter(self, x, y):
-        
-        x_space, y_space = x[:, 0:1], x[:, 1:2]
-        
-        x_upper = np.less_equal(x_space, 54*0.1)
-        x_lower = np.greater(x_space,32*0.1)
-        cond_1 = np.logical_and(x_upper, x_lower)
-        
-        y_upper = np.less_equal(y_space, 54*0.1)
-        y_lower = np.greater(y_space,32*0.1)
-        cond_2 = np.logical_and(y_upper, y_lower)
-        
-        D0 = np.ones_like(x_space)*0.02 
-        D1 = np.ones_like(x_space)*0.1
-        D = np.where(np.logical_and(cond_1, cond_2),D0,D1)
-        return np.concat((y[:,0:2],D), axis=1)
 
 
 class RMSELoss(nn.Module):
@@ -251,7 +237,7 @@ class FNN_D(nn.Module):
             x = self.linears[i](x)
             x = torch.tanh(x)
         x = self.linears[-1](x)
-        x = torch.sigmoid(x)*0.0009 + 0.0001
+        x = torch.sigmoid(x)*0.9 + 0.1
         return x
 
 
@@ -273,7 +259,8 @@ class FNN_AP(nn.Module):
         return x
 
 
-# def model_visual_evaluator(model, data):
+# def model_visual_evaluator(model, data):net_ap = FNN_AP([input_size] + [hidden_layer_size] * num_hidden_layers + [output_size])
+
 
 class model_trainer_u():
     def __init__(self, model_u, model_d, train_data, test_data, epochs, batch_size, geomtime, bc, loss):
@@ -1360,22 +1347,22 @@ class model_trainer_egm_homogeneous_no_pinn():
 
 
 class model_trainer_egm_heterogeneous():
-    def __init__(self, model_u, model_d, train_data, test_data, epochs, batch_size, geomtime, bc, loss, system):
+    def __init__(self, model_u, model_d, train_data, test_data, batch_size, geomtime, bc, loss, system):
         self.model_u = model_u
         self.model_d = model_d
-        self.train_data = egm_sampler(train_data, system)
-        self.test_data = egm_sampler(test_data, system)
-        self.epochs = epochs
+        self.train_data = train_data
+        self.test_data = test_data
         self.geomtime = geomtime
         self.bc = bc
         self.t = np.arange(system.min_t, system.max_t, system.t_step)
         self.system = system
 
+
         w_x = np.arange( -4, 4+0.01, 0.01) # TODO: maybe here need to add linspace and 256 samples, will see.
         w_y = np.arange( -4, 4+0.01, 0.01)
 
-        w_x = np.linspace( -4, 4+0.01, 129) # TODO: maybe here need to add linspace and 256 samples, will see.
-        w_y = np.linspace( -4, 4+0.01, 129)
+        w_x = np.linspace( -4, 4+0.01, 257) # TODO: maybe here need to add linspace and 256 samples, will see.
+        w_y = np.linspace( -4, 4+0.01, 257)
 
         w_x, w_y = np.meshgrid(w_x, w_y, sparse = False, indexing = 'ij')
         self.r_egm = 1/np.sqrt(w_x**2 + w_y**2 + 0.01)
@@ -1394,34 +1381,43 @@ class model_trainer_egm_heterogeneous():
         self.pinn_test = DataLoader(self.test_data, batch_size = batch_size, collate_fn=torch.vstack, num_workers = 0)
 
         self.pinn_train = DataLoader(self.train_data, batch_size = batch_size, collate_fn=torch.vstack, num_workers = 0) 
-        
-        self.d = torch.as_tensor(np.tile(system.D.reshape(-1,1).squeeze(),self.batch_size))
 
-    def train(self, draw_figure = False):
-
-        self.optimiser_u = torch.optim.Adam(self.model_u.parameters(), 0.0001)
-        self.optimiser_d = torch.optim.Adam(self.model_d.parameters(), 0.0001)
         
-        for epoch in range(self.epochs):
+        
+
+    def train(self, epochs, learning_rate, draw_figure = False, savedir = None, loss_weights = [0,0,0,0], verbose = True):
+
+        self.optimiser_u = torch.optim.Adam(self.model_u.parameters(), learning_rate)
+        self.optimiser_d = torch.optim.Adam(self.model_d.parameters(), learning_rate)
+        
+        
+        losses_log = []
+        test_losses_log = []
+        
+        for epoch in range(epochs):
             total_ap_loss = 0
-            total_d_loss = 0
+            losses = [0, 0, 0, 0, 0] # phi, bc, v, w, u
+            
+            
 
 
             for i, batch in enumerate(self.pinn_train):
-                self.d = torch.as_tensor(np.tile(self.system.D.reshape(-1,1).squeeze(),len(batch)//(128*128)))
+                
                 x_i = batch[:,:3].float()
+                xy_i = batch[:,:2].float()
                 x_i.requires_grad = True
+                xy_i.requires_grad = True
+
                 u_i = batch[:,3].reshape(-1,1).reshape((len(batch)//(128*128),1,128,128)).float()
 
                 self.optimiser_u.zero_grad()
-                self.optimiser_d.zero_grad()
 
                 # First through the network
                 u_i_hat = self.model_u(x_i)
-                d_i_hat = self.model_d(x_i[:,:2]).reshape((len(batch)//(128*128), 1, 128, 128))
-                dv_y, dv_x = torch.gradient(u_i_hat[...,2].reshape((len(batch)//(128*128), 1, 128,128)), spacing = 0.3125, dim= (2,3))
-                dv_yy = torch.gradient(d_i_hat*dv_y.reshape((len(batch)//(128*128), 1,128,128)), spacing = 0.3125, dim= 2)[0]
-                dv_xx = torch.gradient(d_i_hat*dv_x.reshape((len(batch)//(128*128), 1,128,128)), spacing = 0.3125, dim= 3)[0]
+                d_i_hat = self.model_d(xy_i)
+                dv_y, dv_x = torch.gradient(u_i_hat[...,2].reshape((len(batch)//(128*128), 1, 128,128))*d_i_hat.reshape((len(batch)//(128*128), 1, 128,128)), spacing = 0.3125, dim= (2,3))
+                dv_yy = torch.gradient(dv_y.reshape((len(batch)//(128*128), 1,128,128)), spacing = 0.3125, dim= 2)[0]
+                dv_xx = torch.gradient(dv_x.reshape((len(batch)//(128*128), 1,128,128)), spacing = 0.3125, dim= 3)[0]
                 ddv = (dv_xx+dv_yy)
 
                 phi_hat = torch.nn.functional.conv2d(  ddv, self.r_egm, padding='same')
@@ -1430,44 +1426,99 @@ class model_trainer_egm_heterogeneous():
                 bc_idx = self.geomtime.on_boundary(x_i.detach().cpu().numpy())
                 dydx = torch.autograd.grad(u_i_hat, x_i, grad_outputs = torch.ones_like(u_i_hat), retain_graph=True)[0][bc_idx]
                 n = torch.as_tensor(self.bc.geom.boundary_normal(x_i.detach().cpu().numpy())[bc_idx])
-                bc_loss = torch.sum(abs(dydx*n))
+                bc_loss = torch.mean(abs(dydx*n))
 
                 # Let's add residual losses
-                res_losses =  self.system.heterogeneous_pde_loss(x_i, u_i_hat, d_i_hat)
-                u_res = torch.sqrt(torch.mean(torch.pow(res_losses[0],2)))
-                v_res = torch.sqrt(torch.mean(torch.pow(res_losses[1],2)))
-                w_res = torch.sqrt(torch.mean(torch.pow(res_losses[2],2)))
+                res_losses =  0 #self.system.heterogeneous_pde_loss(x_i, u_i_hat, d_i_hat, xy_i)
+                u_res = 0#torch.sqrt(torch.mean(torch.pow(res_losses[0],2)))
+                v_res = 0#torch.sqrt(torch.mean(torch.pow(res_losses[1],2)))
+                w_res = 0#torch.sqrt(torch.mean(torch.pow(res_losses[2],2)))
+                
+                phi_loss = self.loss(phi_hat, u_i)
 
                 # Regular loss
-                ap_loss = self.loss(phi_hat, u_i) + bc_loss + u_res + v_res + w_res
+                l_bc = 1+loss_weights[0]
+                l_u = 1+loss_weights[1]
+                l_v = 1+loss_weights[2]
+                l_w = 1+loss_weights[3]
+
+                ap_loss = phi_loss  + bc_loss*l_bc + u_res*l_u + v_res*l_v + w_res*l_w
 
                 ap_loss.backward()
-                
 
                 self.optimiser_u.step()
                 self.optimiser_d.step()
                 
+                # Logging losses
                 total_ap_loss += ap_loss.detach().item()
+                losses[0]+= phi_loss.detach().item()
+                losses[1]+= bc_loss#.detach().item()
+                losses[2]+=u_res#.detach().item()
+                losses[3]+=v_res#.detach().item()
+                losses[4]+=w_res#.detach().item()
+                
+                
+                
             total_ap_loss /= i+1
             self.total_train_ap_loss.append(total_ap_loss)
+            losses_log.append([a_loss/(i+1) for a_loss in losses])
             
-            if epoch%(self.epochs//10)==0:
-
-                print(f'AP loss is {total_ap_loss} for epoch {epoch}.')
+            if epoch%(epochs//100)==0:
+                if verbose:
+                    print(f'AP loss is {total_ap_loss} for epoch {epoch}, all losses are {losses}')
                 if draw_figure==True:
-                    fig = plt.figure(figsize = (10,5))
-                    ax =plt.subplot(1,3,1)
-                    im = ax.imshow(phi_hat[0][0].detach().cpu().numpy())
+                    fig = plt.figure(figsize = (20,10))
+                    ax =plt.subplot(2,4,1)
+                    im = ax.imshow(phi_hat[-1][0].detach().cpu().numpy())
+                    ax.set_title('EGM prediction')
                     plt.colorbar(im, ax = ax)
-                    ax =plt.subplot(1,3,2)
-                    im = ax.imshow(u_i[0][0].detach().cpu().numpy())
+                    
+                    ax =plt.subplot(2,4,5)
+                    im = ax.imshow(u_i[-1][0].detach().cpu().numpy())
+                    ax.set_title('EGM ground truth')
                     plt.colorbar(im, ax = ax)
-                    ax =plt.subplot(1,3,3)
-                    im = ax.imshow(u_i_hat[...,2].reshape((len(batch)//(128*128), 128, 128))[0].detach().cpu().numpy())
+                    
+                    ax =plt.subplot(2,4,2)
+                    im = ax.imshow(u_i_hat[...,2].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+                    ax.set_title('AP prediction')
                     plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,6)
+                    im = ax.imshow(batch[:,7].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+                    ax.set_title('AP ground truth')
+                    plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,3)
+                    im = ax.imshow(u_i_hat[...,0].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+                    ax.set_title('v prediction')
+                    plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,7)
+                    im = ax.imshow(batch[:,5].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+                    ax.set_title('v ground truth')
+                    plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,4)
+                    im = ax.imshow(u_i_hat[...,1].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+                    ax.set_title('w prediction')
+                    plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,8)
+                    im = ax.imshow(batch[:,6].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+                    ax.set_title('w ground truth')
+                    plt.colorbar(im, ax = ax)
+
+                    if savedir is not None:
+                        plt.savefig(os.path.join( savedir, f'train_{epoch}.png'), bbox_inches='tight')
+                        torch.save(self.model_u, os.path.join(savedir, f'model_u_{epoch}.pt'))
+
+
                     plt.show()
-
-
+                    if verbose:
+                        print(50*'++')
+                    
+                    
+            losses = [0, 0, 0, 0, 0]
             test_ap_loss = 0
             for i, batch in enumerate(self.pinn_test):
                 self.d = torch.as_tensor(np.tile(self.system.D.reshape(-1,1).squeeze(),len(batch)//(128*128)))
@@ -1478,8 +1529,8 @@ class model_trainer_egm_heterogeneous():
                 # First through the network
                 u_i_hat = self.model_u(x_i)
                 dv_y, dv_x = torch.gradient(u_i_hat[...,2].reshape((len(batch)//(128*128), 1, 128,128)), spacing = 0.3125, dim= (2,3))
-                dv_yy = torch.gradient(dv_y.reshape((self.batch_size, 1,128,128)), spacing = 0.3125, dim= 2)[0]
-                dv_xx = torch.gradient(dv_x.reshape((self.batch_size, 1,128,128)), spacing = 0.3125, dim= 3)[0]
+                dv_yy = torch.gradient(dv_y.reshape((len(batch)//(128*128), 1,128,128)), spacing = 0.3125, dim= 2)[0]
+                dv_xx = torch.gradient(dv_x.reshape((len(batch)//(128*128), 1,128,128)), spacing = 0.3125, dim= 3)[0]
                 ddv = (dv_xx+dv_yy)
 
                 phi_hat = torch.nn.functional.conv2d(  ddv, self.r_egm, padding='same')
@@ -1488,35 +1539,146 @@ class model_trainer_egm_heterogeneous():
                 bc_idx = self.geomtime.on_boundary(x_i.detach().cpu().numpy())
                 dydx = torch.autograd.grad(u_i_hat, x_i, grad_outputs = torch.ones_like(u_i_hat), retain_graph=True)[0][bc_idx]
                 n = torch.as_tensor(self.bc.geom.boundary_normal(x_i.detach().cpu().numpy())[bc_idx])
-                bc_loss = torch.sum(abs(dydx*n))
+                bc_loss = torch.mean(abs(dydx*n))
 
                 # Let's add residual losses
-                res_losses =  self.system.homogeneous_pde_loss(x_i, u_i_hat, d_i_hat)
+                res_losses =  self.system.homogeneous_pde_loss(x_i, u_i_hat, self.d)
                 u_res = torch.sqrt(torch.mean(torch.pow(res_losses[0],2)))
                 v_res = torch.sqrt(torch.mean(torch.pow(res_losses[1],2)))
                 w_res = torch.sqrt(torch.mean(torch.pow(res_losses[2],2)))
 
+                phi_loss = self.loss(phi_hat, u_i)
+
                 # Regular loss
-                ap_loss = self.loss(phi_hat, u_i) + bc_loss + u_res + v_res + w_res
+                ap_loss = phi_loss + bc_loss + u_res + v_res + w_res
 
                 test_ap_loss += ap_loss.detach().item()
-            test_ap_loss /= i+1
-            self.total_test_ap_loss.append(total_ap_loss)
-            
-            if epoch%(self.epochs//10)==0:
+                losses[0]+= phi_loss.detach().item()
+                losses[1]+= bc_loss.detach().item()
+                losses[2]+=u_res.detach().item()
+                losses[3]+=v_res.detach().item()
+                losses[4]+=w_res.detach().item()
+                break
 
-                print(f'Test AP loss is {test_ap_loss}')
+            test_ap_loss /= i+1
+            test_losses_log.append([a_loss/(i+1) for a_loss in losses])
+
+            self.total_test_ap_loss.append(test_ap_loss)
+            
+            if epoch%(epochs//100)==0:
+
+                if verbose:
+                    print(f'AP loss is {test_ap_loss} for epoch {epoch}, all losses are {losses}')
                 if draw_figure==True:
-                    fig = plt.figure(figsize = (10,5))
-                    ax =plt.subplot(1,3,1)
-                    im = ax.imshow(phi_hat[0][0].detach().cpu().numpy())
+                    fig = plt.figure(figsize = (20,10))
+                    ax =plt.subplot(2,4,1)
+                    im = ax.imshow(phi_hat[-1][0].detach().cpu().numpy())
+                    ax.set_title('EGM prediction')
                     plt.colorbar(im, ax = ax)
-                    ax =plt.subplot(1,3,2)
-                    im = ax.imshow(u_i[0][0].detach().cpu().numpy())
+                    
+                    ax =plt.subplot(2,4,5)
+                    im = ax.imshow(u_i[-1][0].detach().cpu().numpy())
+                    ax.set_title('EGM ground truth')
                     plt.colorbar(im, ax = ax)
-                    ax =plt.subplot(1,3,3)
-                    im = ax.imshow(u_i_hat[...,2].reshape((self.batch_size,128, 128))[0].detach().cpu().numpy())
+                    
+                    ax =plt.subplot(2,4,2)
+                    im = ax.imshow(u_i_hat[...,2].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+                    ax.set_title('AP prediction')
                     plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,6)
+                    im = ax.imshow(batch[:,7].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+                    ax.set_title('AP ground truth')
+                    plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,3)
+                    im = ax.imshow(u_i_hat[...,0].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+                    ax.set_title('v prediction')
+                    plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,7)
+                    im = ax.imshow(batch[:,5].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+                    ax.set_title('v ground truth')
+                    plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,4)
+                    im = ax.imshow(u_i_hat[...,1].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+                    ax.set_title('w prediction')
+                    plt.colorbar(im, ax = ax)
+                    
+                    ax =plt.subplot(2,4,8)
+                    im = ax.imshow(batch[:,6].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+                    ax.set_title('w ground truth')
+                    plt.colorbar(im, ax = ax)
+
+                    if savedir is not None:
+                        plt.savefig(os.path.join( savedir, f'test_epoch{epoch}.png'), bbox_inches='tight')
+
                     plt.show()
-        # print(i)
-        return self.model_u
+                    if verbose:
+                        print(50*'++')
+                        print(50*'++')
+                        print(50*'++')
+
+        fig = plt.figure(figsize = (20,10))
+        ax =plt.subplot(2,4,1)
+        im = ax.imshow(phi_hat[-1][0].detach().cpu().numpy())
+        ax.set_title('EGM prediction')
+        plt.colorbar(im, ax = ax)
+        
+        ax =plt.subplot(2,4,5)
+        im = ax.imshow(u_i[-1][0].detach().cpu().numpy())
+        ax.set_title('EGM ground truth')
+        plt.colorbar(im, ax = ax)
+        
+        ax =plt.subplot(2,4,2)
+        im = ax.imshow(u_i_hat[...,2].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+        ax.set_title('AP prediction')
+        plt.colorbar(im, ax = ax)
+        
+        ax =plt.subplot(2,4,6)
+        im = ax.imshow(batch[:,7].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+        ax.set_title('AP ground truth')
+        plt.colorbar(im, ax = ax)
+        
+        ax =plt.subplot(2,4,3)
+        im = ax.imshow(u_i_hat[...,0].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+        ax.set_title('v prediction')
+        plt.colorbar(im, ax = ax)
+        
+        ax =plt.subplot(2,4,7)
+        im = ax.imshow(batch[:,5].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+        ax.set_title('v ground truth')
+        plt.colorbar(im, ax = ax)
+        
+        ax =plt.subplot(2,4,4)
+        im = ax.imshow(u_i_hat[...,1].reshape((len(batch)//(128*128), 128, 128))[-1].detach().cpu().numpy())
+        ax.set_title('w prediction')
+        plt.colorbar(im, ax = ax)
+        
+        ax =plt.subplot(2,4,8)
+        im = ax.imshow(batch[:,6].reshape(-1,1).reshape((len(batch)//(128*128),128,128))[-1].detach().cpu().numpy())
+        ax.set_title('w ground truth')
+        plt.colorbar(im, ax = ax)
+
+        if savedir is not None:
+            plt.savefig(os.path.join( savedir, f'train_{epoch}.png'), bbox_inches='tight')
+            torch.save(self.model_u, os.path.join(savedir, f'model_u_{epoch}.pt'))
+        return self.model_u, [losses_log, test_losses_log]
+
+    def incremental_train(self, epochs, learning_rate, draw_figure = False, savedir = None, loss_weights = [0,0,0,0]):
+
+        increment = [0]
+        while len(increment) <= len(self.train_data):
+
+            self.pinn_train = DataLoader(Subset(self.train_data, increment), batch_size = self.batch_size, collate_fn=torch.vstack, num_workers = 0) 
+            
+
+            self.pinn_test = DataLoader(Subset(self.train_data, [increment[-1]+1]), batch_size = self.batch_size, collate_fn=torch.vstack, num_workers = 0)
+
+            self.model_u, losses = self.train( epochs//len(self.train_data), learning_rate, draw_figure, savedir, loss_weights )
+            increment.append(increment[-1]+1)
+        return self.model_u, losses
+
+    
+    
